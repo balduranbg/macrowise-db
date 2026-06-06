@@ -21,6 +21,10 @@ Environment variables (optional):
 
 import argparse
 import csv
+import sys
+
+# OFF CSV has some very large fields — increase the limit
+csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
 import gzip
 import hashlib
 import io
@@ -29,10 +33,9 @@ import logging
 import os
 import shutil
 import sqlite3
-import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -210,9 +213,13 @@ def build_off_image_url(barcode: str) -> str | None:
 def pick_display_name(names: dict[str, str]) -> str | None:
     """
     Pick the best display name from a language->name dict.
-    Prefers languages in DISPLAY_LANGUAGE_PRIORITY order.
-    Falls back to any non-empty name.
+    Prefers 'en' first, then languages in DISPLAY_LANGUAGE_PRIORITY order,
+    then falls back to any non-empty name.
     """
+    # Try English first (most common in OFF CSV)
+    if names.get("en", "").strip():
+        return names["en"].strip()
+    # Try priority languages
     for lang in DISPLAY_LANGUAGE_PRIORITY:
         if names.get(lang, "").strip():
             return names[lang].strip()
@@ -232,6 +239,13 @@ def insert_food(conn: sqlite3.Connection, food: dict, names: dict[str, str]) -> 
     for field in REQUIRED_NUTRIENTS:
         if food.get(field) is None:
             return None
+
+    # Round all numeric nutrient fields to 2 decimal places
+    nutrient_fields = ["calories", "protein", "fat", "carbs", "fiber",
+                       "sugar", "sodium", "potassium", "saturated_fat", "cholesterol"]
+    for field in nutrient_fields:
+        if food.get(field) is not None:
+            food[field] = round(float(food[field]), 2)
 
     # Need at least one name
     display_name = pick_display_name(names)
@@ -300,7 +314,12 @@ def download_off_csv(dest_path: str) -> None:
     log.info(f"Downloading OFF CSV dump from {OFF_CSV_URL}")
     log.info("This is a large file (~900MB). Please be patient.")
 
-    response = requests.get(OFF_CSV_URL, stream=True)
+    headers = {
+        "User-Agent": "Macrowise/1.0 (contact@macrowise.app)",
+        "Accept-Encoding": "identity",  # Prevent double-compression issues
+    }
+
+    response = requests.get(OFF_CSV_URL, stream=True, headers=headers)
     response.raise_for_status()
 
     total = int(response.headers.get("content-length", 0))
@@ -329,18 +348,12 @@ def process_off_csv(conn: sqlite3.Connection, csv_gz_path: str,
         reader = csv.DictReader(gz, delimiter="\t")
         headers = reader.fieldnames or []
 
-        # Discover all language name columns dynamically
-        # OFF uses columns like: product_name, product_name_en, product_name_fr, etc.
-        lang_columns: dict[str, str] = {}  # column_name -> language_code
-        for h in headers:
-            if h == "product_name":
-                lang_columns[h] = "xx"  # unknown/default language
-            elif h.startswith("product_name_") and len(h) > 13:
-                lang = h[13:]  # e.g. "product_name_en" -> "en"
-                if 2 <= len(lang) <= 5:  # reasonable language code length
-                    lang_columns[h] = lang
-
-        log.info(f"Found {len(lang_columns)} language name columns in OFF CSV")
+        # OFF CSV has a single product_name column — no per-language variants
+        # Multilingual names are only available via the API, not the CSV dump
+        # We store product_name as 'en' by default (most OFF names are in the
+        # product's local language, but 'en' is the most common single language)
+        # The API-based search (via Worker) handles multilingual queries separately
+        log.info("OFF CSV uses single product_name column — storing as primary name")
 
         batch_count = 0
 
@@ -374,16 +387,22 @@ def process_off_csv(conn: sqlite3.Connection, csv_gz_path: str,
                     stats["skipped_nutrients"] += 1
                     continue
 
-                # --- Extract names across all languages ---
-                names: dict[str, str] = {}
-                for col, lang in lang_columns.items():
-                    val = row.get(col, "").strip()
-                    if val:
-                        names[lang] = val
-
-                if not names:
+                # --- Extract name ---
+                # Use product_name as primary; fall back to generic_name
+                name = (row.get("product_name", "") or
+                        row.get("generic_name", "") or "").strip()
+                if not name:
                     stats["skipped_noname"] += 1
                     continue
+
+                # Store under 'en' as the primary language
+                # Additional language names can be enriched later via API
+                names = {"en": name}
+
+                # Also store abbreviated name if different
+                abbrev = row.get("abbreviated_product_name", "").strip()
+                if abbrev and abbrev.lower() != name.lower():
+                    names["en_abbrev"] = abbrev
 
                 # --- Extract metadata ---
                 barcode = row.get("code", "").strip() or None
@@ -649,18 +668,16 @@ def compress_db(db_path: str, gz_path: str) -> str:
     return checksum
 
 
-def write_version_file(version: str, checksum: str, db_path: str,
+def write_version_file(version: str, checksum: str, output_path: str,
                        gz_path: str, stats: dict) -> None:
     """Write a version.json file alongside the database."""
-    gz_size = os.path.getsize(gz_path)
-    db_size = os.path.getsize(db_path)
+    output_size = os.path.getsize(output_path)
 
     version_data = {
         "version":          version,
-        "built_at":         datetime.utcnow().isoformat() + "Z",
+        "built_at":         datetime.now(timezone.utc).isoformat(),
         "checksum_sha256":  checksum,
-        "compressed_bytes": gz_size,
-        "uncompressed_bytes": db_size,
+        "file_bytes":       output_size,
         "stats":            stats,
     }
 
@@ -692,7 +709,7 @@ def main():
     args = parser.parse_args()
 
     # Version string: YYYY-MM
-    version = datetime.utcnow().strftime("%Y-%m")
+    version = datetime.now(timezone.utc).strftime("%Y-%m")
 
     log.info(f"=== Macrowise Food Database Builder ===")
     log.info(f"Version: {version}")
@@ -706,12 +723,17 @@ def main():
         log.warning("Using DEMO_KEY for USDA — rate limits apply. "
                     "Set USDA_API_KEY env var for production.")
 
-    # Work in a temp directory, move output files when done
-    work_dir = tempfile.mkdtemp(prefix="macrowise_build_")
+    # Work directory — use persistent cache dir if --keep-csv, otherwise temp
+    if args.keep_csv:
+        work_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cache")
+        os.makedirs(work_dir, exist_ok=True)
+        log.info(f"Using persistent cache directory: {os.path.abspath(work_dir)}")
+    else:
+        work_dir = tempfile.mkdtemp(prefix="macrowise_build_")
+        log.info(f"Working directory: {work_dir}")
+
     db_path  = os.path.join(work_dir, DB_NAME)
     gz_path  = os.path.join(work_dir, GZ_NAME)
-
-    log.info(f"Working directory: {work_dir}")
 
     try:
         # --- Open database ---
@@ -752,19 +774,22 @@ def main():
 
         # --- Compress ---
         checksum = ""
+        actual_output_path = ""
         if not args.no_compress:
             checksum = compress_db(db_path, gz_path)
             output_gz = os.path.join(".", GZ_NAME)
             shutil.move(gz_path, output_gz)
+            actual_output_path = output_gz
             log.info(f"Output: {output_gz}")
         else:
             output_db = os.path.join(".", DB_NAME)
             shutil.move(db_path, output_db)
+            actual_output_path = output_db
             log.info(f"Output (uncompressed): {output_db}")
 
         # --- Write version file ---
         final_gz = GZ_NAME if not args.no_compress else DB_NAME
-        write_version_file(version, checksum, db_path, final_gz, {
+        write_version_file(version, checksum, actual_output_path, final_gz, {
             **all_stats,
             "total_foods": total_foods,
             "total_names": total_names,
@@ -781,7 +806,8 @@ def main():
         sys.exit(1)
 
     finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+        if not args.keep_csv:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
