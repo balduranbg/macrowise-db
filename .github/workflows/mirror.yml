@@ -1,0 +1,21 @@
+name: Mirror to Forgejo
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mirror to Forgejo
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: |
+          git remote add forgejo https://victor:${FORGEJO_TOKEN}@forgejo.balduranbg.synology.me/victor/macrowise-db.git
+          git push forgejo main --force
