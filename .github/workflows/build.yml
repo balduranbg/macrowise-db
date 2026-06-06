@@ -1,0 +1,154 @@
+name: Build macrowise-foods.db
+
+on:
+  # Run on the first Sunday of each month at 02:00 UTC
+  # GitHub Actions cron doesn't support "first Sunday" directly,
+  # so we run every Sunday and check the date in the job.
+  schedule:
+    - cron: "0 2 * * 0"   # Every Sunday at 02:00 UTC
+
+  # Allow manual trigger from GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Row limit per source (leave empty for full build)"
+        required: false
+        default: ""
+      off_only:
+        description: "Process OFF only (skip USDA)"
+        type: boolean
+        default: false
+      usda_only:
+        description: "Process USDA only (skip OFF)"
+        type: boolean
+        default: false
+
+jobs:
+  check-first-sunday:
+    name: Check if first Sunday of month
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Check date
+        id: check
+        run: |
+          # Always run on manual dispatch
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            echo "Manual dispatch — running regardless of date"
+            exit 0
+          fi
+
+          # For scheduled runs: only proceed if day of month <= 7
+          # (guarantees it's the first Sunday of the month)
+          DAY=$(date +%d)
+          if [ "$DAY" -le 7 ]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            echo "First Sunday of month (day $DAY) — proceeding"
+          else
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            echo "Not first Sunday (day $DAY) — skipping"
+          fi
+
+  build:
+    name: Build food database
+    needs: check-first-sunday
+    if: needs.check-first-sunday.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120   # Full build can take 60-90 minutes
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install requests tqdm
+
+      - name: Set version string
+        id: version
+        run: |
+          VERSION=$(date +%Y-%m)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Build database (full)
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.limit == '')
+        env:
+          USDA_API_KEY: ${{ secrets.USDA_API_KEY }}
+        run: |
+          cd scripts
+          ARGS=""
+          if [ "${{ inputs.off_only }}" = "true" ]; then ARGS="$ARGS --off-only"; fi
+          if [ "${{ inputs.usda_only }}" = "true" ]; then ARGS="$ARGS --usda-only"; fi
+          python3 build_db.py $ARGS
+          # Move outputs up to repo root
+          mv macrowise-foods.db.gz ../
+          mv version.json ../
+
+      - name: Build database (limited — test/manual)
+        if: github.event_name == 'workflow_dispatch' && inputs.limit != ''
+        env:
+          USDA_API_KEY: ${{ secrets.USDA_API_KEY }}
+        run: |
+          cd scripts
+          ARGS="--limit ${{ inputs.limit }}"
+          if [ "${{ inputs.off_only }}" = "true" ]; then ARGS="$ARGS --off-only"; fi
+          if [ "${{ inputs.usda_only }}" = "true" ]; then ARGS="$ARGS --usda-only"; fi
+          python3 build_db.py $ARGS
+          mv macrowise-foods.db.gz ../
+          mv version.json ../
+
+      - name: Verify output files exist
+        run: |
+          ls -lh macrowise-foods.db.gz version.json
+          echo "Database size: $(du -sh macrowise-foods.db.gz | cut -f1)"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: "Food Database ${{ steps.version.outputs.version }}"
+          body_path: version.json
+          files: |
+            macrowise-foods.db.gz
+            version.json
+          make_latest: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Worker version endpoint
+        # Updates the Cloudflare Worker with the new version info
+        # so the app knows a new database is available
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_WORKER_NAME: macrowise-api
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          CHECKSUM=$(jq -r '.checksum_sha256' version.json)
+          SIZE=$(jq -r '.compressed_bytes' version.json)
+          DOWNLOAD_URL="https://github.com/${{ github.repository_owner }}/macrowise-db/releases/download/${VERSION}/macrowise-foods.db.gz"
+
+          # Update Worker environment variables via Cloudflare API
+          curl -s -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${CLOUDFLARE_WORKER_NAME}/settings" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"bindings\": [
+                {\"type\": \"plain_text\", \"name\": \"DB_VERSION\",  \"text\": \"${VERSION}\"},
+                {\"type\": \"plain_text\", \"name\": \"DB_URL\",      \"text\": \"${DOWNLOAD_URL}\"},
+                {\"type\": \"plain_text\", \"name\": \"DB_CHECKSUM\", \"text\": \"${CHECKSUM}\"},
+                {\"type\": \"plain_text\", \"name\": \"DB_SIZE\",     \"text\": \"${SIZE}\"}
+              ]
+            }" | jq '.success'
+
+          echo "Worker updated with new database version: $VERSION"
