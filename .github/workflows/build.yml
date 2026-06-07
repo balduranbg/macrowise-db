@@ -91,7 +91,7 @@ jobs:
           if [ "${{ inputs.usda_only }}" = "true" ]; then ARGS="$ARGS --usda-only"; fi
           python3 build_db.py $ARGS
           # Move outputs up to repo root
-          mv macrowise-foods.db.gz ../
+          mv macrowise-foods.db.zst ../
           mv version.json ../
 
       - name: Build database (limited — test/manual)
@@ -104,7 +104,7 @@ jobs:
           if [ "${{ inputs.off_only }}" = "true" ]; then ARGS="$ARGS --off-only"; fi
           if [ "${{ inputs.usda_only }}" = "true" ]; then ARGS="$ARGS --usda-only"; fi
           python3 build_db.py $ARGS
-          mv macrowise-foods.db.gz ../
+          mv macrowise-foods.db.zst ../
           mv version.json ../
 
       - name: Verify output files exist
