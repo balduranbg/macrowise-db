@@ -57,6 +57,8 @@ jobs:
     if: needs.check-first-sunday.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 120   # Full build can take 60-90 minutes
+    permissions:
+      contents: write      # Required to create GitHub Releases
 
     steps:
       - name: Checkout repository
