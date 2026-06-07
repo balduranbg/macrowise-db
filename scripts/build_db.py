@@ -803,7 +803,8 @@ def main():
             output_gz = os.path.join(".", GZ_NAME)
             shutil.move(gz_path, output_gz)
             actual_output_path = output_gz
-            log.info(f"Output: {output_gz}")        else:
+            log.info(f"Output: {output_gz}")
+        else:
             output_db = os.path.join(".", DB_NAME)
             shutil.move(db_path, output_db)
             actual_output_path = output_db
