@@ -51,7 +51,7 @@ OFF_CSV_URL = "https://static.openfoodfacts.org/data/en.openfoodfacts.org.produc
 USDA_SEARCH_URL = "https://api.nal.usda.gov/fdc/v1/foods/list"
 
 DB_NAME = "macrowise-foods.db"
-GZ_NAME = "macrowise-foods.db.gz"
+GZ_NAME = "macrowise-foods.db.zst"  # zstd compressed (falls back to gzip if zstd unavailable)
 VERSION_FILE = "version.json"
 
 # Minimum nutrient requirements — products missing any of these are excluded
@@ -638,31 +638,54 @@ def create_indexes(conn: sqlite3.Connection) -> None:
     log.info("Indexes created")
 
 
-def compress_db(db_path: str, gz_path: str) -> str:
-    """Compress the SQLite database with gzip. Returns SHA256 of the gz file."""
-    log.info(f"Compressing {db_path} -> {gz_path}")
+def compress_db(db_path: str, out_path: str) -> str:
+    """
+    Compress the SQLite database.
+    Uses zstd if available (better compression), falls back to gzip level 9.
+    Returns SHA256 of the compressed file.
+    """
+    log.info(f"Compressing {db_path} -> {out_path}")
 
     db_size = os.path.getsize(db_path)
     log.info(f"Uncompressed size: {db_size / 1024 / 1024:.1f} MB")
 
     sha256 = hashlib.sha256()
 
-    with open(db_path, "rb") as f_in, \
-         gzip.open(gz_path, "wb", compresslevel=9) as f_out, \
-         tqdm(total=db_size, unit="B", unit_scale=True, desc="Compressing") as bar:
-        while True:
-            chunk = f_in.read(1024 * 1024)
-            if not chunk:
-                break
-            f_out.write(chunk)
-            sha256.update(chunk)
-            bar.update(len(chunk))
+    # Try zstd first (better compression ratio than gzip)
+    try:
+        import zstandard as zstd
+        log.info("Using zstd compression (level 19)")
+        cctx = zstd.ZstdCompressor(level=19, threads=-1)
+        with open(db_path, "rb") as f_in, \
+             open(out_path, "wb") as f_out, \
+             tqdm(total=db_size, unit="B", unit_scale=True, desc="Compressing") as bar:
+            with cctx.stream_writer(f_out) as compressor:
+                while True:
+                    chunk = f_in.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    compressor.write(chunk)
+                    sha256.update(chunk)
+                    bar.update(len(chunk))
 
-    gz_size = os.path.getsize(gz_path)
+    except ImportError:
+        log.info("zstd not available — falling back to gzip level 9")
+        with open(db_path, "rb") as f_in, \
+             gzip.open(out_path, "wb", compresslevel=9) as f_out, \
+             tqdm(total=db_size, unit="B", unit_scale=True, desc="Compressing") as bar:
+            while True:
+                chunk = f_in.read(1024 * 1024)
+                if not chunk:
+                    break
+                f_out.write(chunk)
+                sha256.update(chunk)
+                bar.update(len(chunk))
+
+    out_size = os.path.getsize(out_path)
     checksum = sha256.hexdigest()
 
-    log.info(f"Compressed size: {gz_size / 1024 / 1024:.1f} MB "
-             f"(ratio: {gz_size/db_size:.1%})")
+    log.info(f"Compressed size: {out_size / 1024 / 1024:.1f} MB "
+             f"(ratio: {out_size/db_size:.1%})")
     log.info(f"SHA256: {checksum}")
 
     return checksum
@@ -780,8 +803,7 @@ def main():
             output_gz = os.path.join(".", GZ_NAME)
             shutil.move(gz_path, output_gz)
             actual_output_path = output_gz
-            log.info(f"Output: {output_gz}")
-        else:
+            log.info(f"Output: {output_gz}")        else:
             output_db = os.path.join(".", DB_NAME)
             shutil.move(db_path, output_db)
             actual_output_path = output_db

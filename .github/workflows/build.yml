@@ -71,7 +71,7 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install requests tqdm
+        run: pip install requests tqdm zstandard
 
       - name: Set version string
         id: version
@@ -109,8 +109,8 @@ jobs:
 
       - name: Verify output files exist
         run: |
-          ls -lh macrowise-foods.db.gz version.json
-          echo "Database size: $(du -sh macrowise-foods.db.gz | cut -f1)"
+          ls -lh macrowise-foods.db.zst version.json
+          echo "Database size: $(du -sh macrowise-foods.db.zst | cut -f1)"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -119,7 +119,7 @@ jobs:
           name: "Food Database ${{ steps.version.outputs.version }}"
           body_path: version.json
           files: |
-            macrowise-foods.db.gz
+            macrowise-foods.db.zst
             version.json
           make_latest: true
           fail_on_unmatched_files: true
