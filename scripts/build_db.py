@@ -2,15 +2,15 @@
 """
 build_db.py — Macrowise food database builder
 
-Downloads Open Food Facts CSV dump and USDA FoodData Central JSON,
-strips to Macrowise-relevant fields, builds a SQLite database with
-FTS5 full-text search across all available languages, and compresses
-the result.
+Downloads Open Food Facts CSV dump, USDA FoodData Central JSON, and DSLD
+(Dietary Supplement Label Database) supplement labels, strips to
+Macrowise-relevant fields, builds a SQLite database with FTS5 full-text
+search across all available languages, and compresses the result.
 
 Output: macrowise-foods.db.gz
 
 Usage:
-    python3 build_db.py [--off-only] [--usda-only] [--limit N] [--no-compress]
+    python3 build_db.py [--off-only] [--usda-only] [--dsld-only] [--limit N] [--no-compress]
 
 Dependencies:
     pip install requests tqdm
@@ -41,7 +41,7 @@ from pathlib import Path
 import requests
 from tqdm import tqdm
 
-from categories import normalise_category, normalise_usda_category
+from categories import normalise_category, normalise_dsld_category, normalise_usda_category
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -49,6 +49,8 @@ from categories import normalise_category, normalise_usda_category
 
 OFF_CSV_URL = "https://static.openfoodfacts.org/data/en.openfoodfacts.org.products.csv.gz"
 USDA_SEARCH_URL = "https://api.nal.usda.gov/fdc/v1/foods/list"
+DSLD_SEARCH_URL = "https://api.ods.od.nih.gov/dsld/v9/search-filter"
+DSLD_LABEL_URL = "https://api.ods.od.nih.gov/dsld/v9/label/{id}"
 
 DB_NAME = "macrowise-foods.db"
 GZ_NAME = "macrowise-foods.db.zst"  # zstd compressed (falls back to gzip if zstd unavailable)
@@ -101,6 +103,59 @@ DISPLAY_LANGUAGE_PRIORITY = [
 OFF_CHUNK_SIZE = 10_000     # rows processed per commit
 USDA_PAGE_SIZE = 200        # items per USDA API page
 
+# DSLD physicalState.langualCode values in scope: Powders and Liquids only.
+# Capsules/tablets/gummies/etc. are out of scope — they belong to a separate,
+# dedicated supplement-tracking app. See docs/DSLD_Integration_Brief_1.md §1.
+DSLD_INCLUDED_FORMS = {"E0162", "E0165"}  # Powders, Liquids
+
+# DSLD serving-size volume units -> millilitres (liquids only; see brief §6)
+DSLD_VOLUME_TO_ML = {
+    "ml": 1.0, "milliliter": 1.0,
+    "l": 1000.0, "liter": 1000.0,
+    "tsp": 4.92892, "teaspoon": 4.92892,
+    "tbsp": 14.7868, "tablespoon": 14.7868,
+    "fl oz": 29.5735, "fl. oz.": 29.5735, "fluid ounce": 29.5735,
+    "cup": 236.588,
+}
+
+# DSLD nutrient name keyword matching (case-insensitive substring match).
+# ingredientRows[].ingredientGroup is unreliable (see brief §5) — match on
+# the free-text name instead. Order within each list matters (most specific
+# first, e.g. "total fat" before the bare "fat").
+DSLD_NUTRIENT_KEYWORDS = {
+    "calories":      ["calorie"],
+    "protein":       ["protein"],
+    "fat":           ["total fat", "fat"],       # check "total fat" first
+    "carbs":         ["total carbohydrate", "carbohydrate"],
+    "fiber":         ["dietary fiber", "fiber"],
+    "sugar":         ["total sugar", "sugars", "sugar"],
+    "sodium":        ["sodium"],
+    "potassium":     ["potassium"],
+    "saturated_fat": ["saturated fat"],
+    "cholesterol":   ["cholesterol"],
+}
+
+# Per brief §5: saturated fat, fiber, and sugar are consistently nested under
+# a parent row (Total Fat / Total Carbohydrate) rather than top-level: the two
+# groups must be matched separately to avoid double-counting or misattribution.
+DSLD_TOP_LEVEL_FIELDS = {"calories", "protein", "fat", "carbs", "sodium", "potassium", "cholesterol"}
+DSLD_NESTED_FIELDS = {"saturated_fat", "fiber", "sugar"}
+
+# search-filter's supplement_form param filters server-side on physicalState
+# (verified live — codes documented at the API's own HTML docs page)
+DSLD_SUPPLEMENT_FORM_PARAM = "e0162,e0165"
+
+# search-filter's product_type codes — used to split oversized year buckets
+# (see _enumerate_dsld_ids). Documented at https://api.ods.od.nih.gov/dsld/v9/
+DSLD_PRODUCT_TYPES = [
+    "a1305", "a1306", "a1326", "a1310", "a1302",
+    "a1299", "a1316", "a1315", "a1317", "a1309", "a1325",
+]
+
+DSLD_SEARCH_WINDOW_LIMIT = 9800  # observed ES pagination window caps ~10,000
+DSLD_PAGE_SIZE = 200
+DSLD_MIN_YEAR = 1994  # DSLD program inception
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -123,9 +178,10 @@ CREATE TABLE IF NOT EXISTS foods (
     barcode             TEXT,
     name                TEXT NOT NULL,
     brand               TEXT,
-    source              TEXT NOT NULL,      -- 'OFF' or 'USDA'
+    source              TEXT NOT NULL,      -- 'OFF', 'USDA', or 'DSLD'
     image_url           TEXT,
     food_category       TEXT NOT NULL DEFAULT 'generic',
+    quantity_basis      TEXT NOT NULL DEFAULT 'per_100g',  -- 'per_100g' or 'per_100ml'
     calories            REAL NOT NULL,
     protein             REAL NOT NULL,
     fat                 REAL NOT NULL,
@@ -254,12 +310,12 @@ def insert_food(conn: sqlite3.Connection, food: dict, names: dict[str, str]) -> 
 
     cur = conn.execute("""
         INSERT INTO foods (
-            barcode, name, brand, source, image_url, food_category,
+            barcode, name, brand, source, image_url, food_category, quantity_basis,
             calories, protein, fat, carbs, fiber, sugar,
             sodium, potassium, saturated_fat, cholesterol,
             serving_description, serving_grams, popularity
         ) VALUES (
-            :barcode, :name, :brand, :source, :image_url, :food_category,
+            :barcode, :name, :brand, :source, :image_url, :food_category, :quantity_basis,
             :calories, :protein, :fat, :carbs, :fiber, :sugar,
             :sodium, :potassium, :saturated_fat, :cholesterol,
             :serving_description, :serving_grams, :popularity
@@ -271,6 +327,7 @@ def insert_food(conn: sqlite3.Connection, food: dict, names: dict[str, str]) -> 
         "source":              food["source"],
         "image_url":           food.get("image_url"),
         "food_category":       food.get("food_category", "generic"),
+        "quantity_basis":      food.get("quantity_basis", "per_100g"),
         "calories":            food["calories"],
         "protein":             food["protein"],
         "fat":                 food["fat"],
@@ -621,6 +678,365 @@ def process_usda(conn: sqlite3.Connection, api_key: str,
 
 
 # ---------------------------------------------------------------------------
+# DSLD (Dietary Supplement Label Database) processing
+# ---------------------------------------------------------------------------
+
+def _dsld_search_page(params: dict, from_: int, size: int) -> dict:
+    """One page of the DSLD search-filter endpoint."""
+    query = {**params, "from": from_, "size": size}
+    response = requests.get(DSLD_SEARCH_URL, params=query, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def _dsld_bucket_count(params: dict) -> int:
+    """Total hit count for a search-filter query, without fetching results."""
+    page = _dsld_search_page(params, 0, 1)
+    return page.get("stats", {}).get("count", 0)
+
+
+def _dsld_paginate_ids(params: dict):
+    """Yield label IDs for one search-filter query, staying inside the ES window."""
+    from_ = 0
+    while from_ < DSLD_SEARCH_WINDOW_LIMIT:
+        page = _dsld_search_page(params, from_, DSLD_PAGE_SIZE)
+        hits = page.get("hits", [])
+        if not hits:
+            return
+        for hit in hits:
+            yield hit["_id"]
+        if len(hits) < DSLD_PAGE_SIZE:
+            return
+        from_ += DSLD_PAGE_SIZE
+        time.sleep(0.1)  # Be polite to the DSLD API
+
+
+def _enumerate_dsld_ids():
+    """
+    Yield distinct DSLD label IDs for Powders + Liquids.
+
+    search-filter's supplement_form param filters server-side on
+    physicalState, but the underlying Elasticsearch query window caps at
+    ~10,000 results — well under the ~69k matching products. We bucket by
+    entry year (and, for oversized years, further by product_type) to keep
+    each query under that window.
+
+    This is verified, not assumed: each final bucket's own count is checked
+    against the window (logged if still oversized), and the number of IDs
+    actually paginated out of each bucket is compared against that bucket's
+    reported count (logged if fewer came back than expected — a sign of
+    silent truncation). For oversized years, the product_type sub-buckets'
+    counts are also summed and compared to the year's total, since a product
+    with no product_type match would fall through the split uncounted.
+    """
+    seen: set[str] = set()
+    base_params = {"q": "*", "supplement_form": DSLD_SUPPLEMENT_FORM_PARAM}
+    current_year = datetime.now(timezone.utc).year
+
+    for year in range(DSLD_MIN_YEAR, current_year + 1):
+        year_params = {**base_params, "date_start": year, "date_end": year}
+        year_count = _dsld_bucket_count(year_params)
+        if year_count == 0:
+            continue
+
+        if year_count <= DSLD_SEARCH_WINDOW_LIMIT:
+            buckets = [(year_params, year_count)]
+        else:
+            buckets = []
+            for pt in DSLD_PRODUCT_TYPES:
+                pt_params = {**year_params, "product_type": pt}
+                pt_count = _dsld_bucket_count(pt_params)
+                if pt_count > 0:
+                    buckets.append((pt_params, pt_count))
+            covered = sum(c for _, c in buckets)
+            if covered < year_count:
+                log.warning(
+                    f"DSLD year {year}: product_type split covers {covered}/{year_count} "
+                    f"products — {year_count - covered} product(s) with no matching "
+                    f"product_type will be missed"
+                )
+
+        for bucket_params, bucket_count in buckets:
+            if bucket_count > DSLD_SEARCH_WINDOW_LIMIT:
+                log.warning(
+                    f"DSLD bucket {bucket_params} has {bucket_count} hits, exceeding the "
+                    f"{DSLD_SEARCH_WINDOW_LIMIT}-hit pagination window — this bucket will "
+                    f"be truncated; consider finer-grained bucketing"
+                )
+            yielded = 0
+            for label_id in _dsld_paginate_ids(bucket_params):
+                yielded += 1
+                if label_id not in seen:
+                    seen.add(label_id)
+                    yield label_id
+            if yielded < bucket_count:
+                log.warning(
+                    f"DSLD bucket {bucket_params}: expected {bucket_count} hits, only "
+                    f"retrieved {yielded} — pagination was truncated by the ES window"
+                )
+
+
+def _dsld_isclose(a, b, tol: float = 1e-6) -> bool:
+    return a is not None and b is not None and abs(a - b) < tol
+
+
+def _dsld_pick_quantity(quantity_entries: list, serving_size: dict):
+    """
+    Pick the quantity[] entry matching this label's declared serving size.
+
+    Per brief §5, match explicitly against servingSizes[0].minQuantity rather
+    than assuming array position. Some labels (observed on real data, e.g.
+    multi-scoop mass gainers with a serving *range*) instead express
+    servingSizeQuantity as a serving-multiple count — e.g. "5" meaning
+    "5 scoops" — that matches maxQuantity/minQuantity rather than a raw
+    quantity. We fall back to that interpretation before giving up.
+
+    Most labels carry >1 matching entry per row as a matter of course — one
+    per daily-value target group (e.g. adults vs. children) — and those
+    duplicates almost always agree on quantity, so that alone isn't worth
+    flagging. When multiple matching entries disagree on quantity, resolution
+    is NOT by array position — verified against a real disagreement (label
+    6472, "Calories": 170 vs. 80) that the correct entry (80, confirmed
+    against the label's own Atwater-derived macros) was the one carrying a
+    populated dailyValueTargetGroup naming the primary adult group, while the
+    wrong one (170) had an empty dailyValueTargetGroup — i.e. it looks like
+    an incomplete/malformed duplicate row, not a legitimate alternate
+    reading. So: prefer the entry tagged for the primary adult group; if
+    that's not decisive, prefer any entry with a populated
+    dailyValueTargetGroup over one with none; only if still tied (e.g. two
+    differently-populated entries, such as adult vs. child, that actually
+    disagree — not observed in any label checked so far, but plausible) do
+    we fall back to the last array entry, flagged as ambiguous so it can be
+    audited.
+
+    Returns (entry, denominator, ambiguous) where ambiguous is True only if
+    disagreeing entries couldn't be resolved by target group and the
+    last-match fallback had to be used, or (None, None, False) if no entry
+    matches.
+    """
+    min_q = serving_size.get("minQuantity")
+    max_q = serving_size.get("maxQuantity")
+
+    def is_primary_adult_group(entry) -> bool:
+        return any("adult" in (g.get("name") or "").lower()
+                   for g in (entry.get("dailyValueTargetGroup") or []))
+
+    def pick(matches):
+        values = {m.get("quantity") for m in matches}
+        if len(values) == 1:
+            return matches[-1], False  # duplicates agree — no ambiguity
+
+        primary = [m for m in matches if is_primary_adult_group(m)]
+        if len(primary) == 1:
+            return primary[0], False  # resolved via target group, not position
+
+        non_empty = [m for m in matches if m.get("dailyValueTargetGroup")]
+        if len(non_empty) == 1:
+            return non_empty[0], False  # resolved via target group, not position
+
+        # Still tied (e.g. multiple adult-tagged entries disagree, or none
+        # are tagged at all) — no principled signal left, fall back and flag.
+        return matches[-1], True
+
+    matches = [e for e in quantity_entries if _dsld_isclose(e.get("servingSizeQuantity"), min_q)]
+    if matches:
+        entry, ambiguous = pick(matches)
+        return entry, min_q, ambiguous
+
+    if min_q and max_q and min_q != max_q:
+        multiple = max_q / min_q
+        matches = [e for e in quantity_entries if _dsld_isclose(e.get("servingSizeQuantity"), multiple)]
+        if matches:
+            entry, ambiguous = pick(matches)
+            return entry, max_q, ambiguous
+
+    return None, None, False
+
+
+def _dsld_match_field(name: str, allowed_fields: set) -> str | None:
+    """Match an ingredientRows[].name string to a Macrowise nutrient field."""
+    name_lower = name.lower()
+    for field, keywords in DSLD_NUTRIENT_KEYWORDS.items():
+        if field not in allowed_fields:
+            continue
+        for kw in keywords:
+            if kw in name_lower:
+                return field
+    return None
+
+
+def _extract_dsld_nutrients(label: dict) -> dict | None:
+    """
+    Walk a DSLD label's ingredientRows and convert to per-100g/per-100ml
+    nutrient values. Returns None if the label has no usable serving size.
+
+    The returned dict includes a "_quantity_basis" key ('per_100g' or
+    'per_100ml') and an "_ambiguous_fields" key (list of field names where
+    _dsld_pick_quantity's last-match tie-break fired) that the caller must
+    pop before further use.
+    """
+    serving_sizes = label.get("servingSizes") or []
+    if not serving_sizes:
+        return None
+    serving_size = serving_sizes[0]
+    min_q = serving_size.get("minQuantity")
+    if not min_q or min_q <= 0:
+        return None
+
+    physical_state = label.get("physicalState") or {}
+    langual = physical_state.get("langualCode")
+
+    ml_per_unit = None
+    if langual == "E0162":
+        quantity_basis = "per_100g"
+    elif langual == "E0165":
+        quantity_basis = "per_100ml"
+        unit = (serving_size.get("unit") or "").strip().lower()
+        ml_per_unit = DSLD_VOLUME_TO_ML.get(unit)
+        if ml_per_unit is None:
+            return None
+    else:
+        return None  # caller already filters on physicalState; defensive only
+
+    nutrients: dict[str, float] = {}
+    ambiguous_fields: list[str] = []
+
+    def resolve(row: dict, allowed_fields: set) -> None:
+        field = _dsld_match_field(row.get("name", ""), allowed_fields)
+        if field is None or field in nutrients:
+            return
+        entry, denom, ambiguous = _dsld_pick_quantity(row.get("quantity", []), serving_size)
+        if entry is None:
+            return
+        value = safe_float(entry.get("quantity"))
+        if value is None:
+            return
+        if ml_per_unit is not None:
+            serving_ml = denom * ml_per_unit
+            if serving_ml <= 0:
+                return
+            nutrients[field] = (value / serving_ml) * 100
+        else:
+            nutrients[field] = (value / denom) * 100
+        if ambiguous:
+            ambiguous_fields.append(field)
+
+    for row in label.get("ingredientRows", []):
+        resolve(row, DSLD_TOP_LEVEL_FIELDS)
+        for nested in row.get("nestedRows", []):
+            resolve(nested, DSLD_NESTED_FIELDS)
+
+    nutrients["_quantity_basis"] = quantity_basis
+    nutrients["_ambiguous_fields"] = ambiguous_fields
+    return nutrients
+
+
+def process_dsld(conn: sqlite3.Connection, limit: int | None = None) -> dict:
+    """
+    Fetch DSLD supplement labels (Powders + Liquids only) and insert into DB.
+
+    Two-step fetch: search-filter to enumerate candidate label IDs (filtered
+    server-side via the supplement_form param), then /label/{id} for full
+    serving-size and nutrient detail. Returns stats dict.
+    """
+    stats = {"processed": 0, "inserted": 0, "skipped_nutrients": 0,
+             "skipped_form": 0, "skipped_noname": 0, "errors": 0, "api_errors": 0,
+             "ambiguous_quantity_labels": 0, "ambiguous_quantity_fields": 0}
+
+    log.info("Fetching DSLD supplement labels (Powders + Liquids)...")
+
+    for label_id in tqdm(_enumerate_dsld_ids(), desc="DSLD labels", unit=" labels"):
+        if limit and stats["processed"] >= limit:
+            break
+
+        stats["processed"] += 1
+
+        try:
+            response = requests.get(DSLD_LABEL_URL.format(id=label_id), timeout=30)
+            response.raise_for_status()
+            label = response.json()
+        except requests.RequestException as e:
+            stats["api_errors"] += 1
+            log.warning(f"DSLD API error fetching label {label_id}: {e}")
+            continue
+        finally:
+            time.sleep(0.1)  # Be polite to the DSLD API
+
+        try:
+            # --- Filter to in-scope physical forms (defensive re-check) ---
+            physical_state = label.get("physicalState") or {}
+            if physical_state.get("langualCode") not in DSLD_INCLUDED_FORMS:
+                stats["skipped_form"] += 1
+                continue
+
+            # --- Extract and convert nutrients ---
+            nutrients = _extract_dsld_nutrients(label)
+            if nutrients is None:
+                stats["skipped_nutrients"] += 1
+                continue
+
+            quantity_basis = nutrients.pop("_quantity_basis")
+            ambiguous_fields = nutrients.pop("_ambiguous_fields")
+            if ambiguous_fields:
+                stats["ambiguous_quantity_labels"] += 1
+                stats["ambiguous_quantity_fields"] += len(ambiguous_fields)
+                log.info(
+                    f"DSLD label {label_id}: last-match tie-break used for "
+                    f"quantity field(s) {ambiguous_fields} (multiple quantity[] "
+                    f"entries shared the same servingSizeQuantity)"
+                )
+
+            if "calories" in nutrients:
+                nutrients["calories"] = round(nutrients["calories"])
+
+            missing = REQUIRED_NUTRIENTS - set(nutrients.keys())
+            if missing:
+                stats["skipped_nutrients"] += 1
+                continue
+
+            # --- Name ---
+            name = (label.get("fullName") or "").strip()
+            if not name:
+                stats["skipped_noname"] += 1
+                continue
+            names = {"en": name}
+
+            # --- Metadata ---
+            brand = (label.get("brandName") or "").strip() or None
+
+            food = {
+                **nutrients,
+                "barcode":             None,   # DSLD has no barcodes
+                "brand":               brand,
+                "source":              "DSLD",
+                "image_url":           None,   # No product images in DSLD
+                "food_category":       normalise_dsld_category(),
+                "serving_description": None,
+                "serving_grams":       None,
+                "popularity":          0,
+                "quantity_basis":      quantity_basis,
+            }
+
+            result = insert_food(conn, food, names)
+            if result is not None:
+                stats["inserted"] += 1
+            else:
+                stats["skipped_noname"] += 1
+
+        except Exception as e:
+            stats["errors"] += 1
+            if stats["errors"] <= 10:
+                log.warning(f"Error processing DSLD label {label_id}: {e}")
+
+        if stats["processed"] % 500 == 0:
+            conn.commit()
+
+    conn.commit()
+    log.info(f"DSLD processing complete: {stats}")
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # Post-processing
 # ---------------------------------------------------------------------------
 
@@ -717,12 +1133,14 @@ def write_version_file(version: str, checksum: str, output_path: str,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Build macrowise-foods.db from OFF and USDA sources"
+        description="Build macrowise-foods.db from OFF, USDA, and DSLD sources"
     )
     parser.add_argument("--off-only",    action="store_true",
                         help="Process only Open Food Facts")
     parser.add_argument("--usda-only",   action="store_true",
                         help="Process only USDA FoodData Central")
+    parser.add_argument("--dsld-only",   action="store_true",
+                        help="Process only DSLD (supplement powders/liquids)")
     parser.add_argument("--limit",       type=int, default=None,
                         help="Limit rows per source (for testing)")
     parser.add_argument("--no-compress", action="store_true",
@@ -734,9 +1152,17 @@ def main():
     # Version string: YYYY-MM
     version = datetime.now(timezone.utc).strftime("%Y-%m")
 
+    # Which sources to run: if any single-source-only flag is set, run only
+    # that source; if none are set, run all three (default).
+    any_only = args.off_only or args.usda_only or args.dsld_only
+    run_off  = args.off_only  or not any_only
+    run_usda = args.usda_only or not any_only
+    run_dsld = args.dsld_only or not any_only
+
     log.info(f"=== Macrowise Food Database Builder ===")
     log.info(f"Version: {version}")
-    log.info(f"Sources: {'OFF only' if args.off_only else 'USDA only' if args.usda_only else 'OFF + USDA'}")
+    sources = [name for name, run in (("OFF", run_off), ("USDA", run_usda), ("DSLD", run_dsld)) if run]
+    log.info(f"Sources: {' + '.join(sources)}")
     if args.limit:
         log.info(f"Limit: {args.limit} rows per source (TEST MODE)")
 
@@ -764,7 +1190,7 @@ def main():
         all_stats = {}
 
         # --- Process Open Food Facts ---
-        if not args.usda_only:
+        if run_off:
             csv_gz_path = os.path.join(work_dir, "off.csv.gz")
 
             # Check if we already have a cached download (useful for reruns)
@@ -781,9 +1207,14 @@ def main():
                 log.info("OFF CSV deleted")
 
         # --- Process USDA ---
-        if not args.off_only:
+        if run_usda:
             usda_stats = process_usda(conn, usda_key, limit=args.limit)
             all_stats["usda"] = usda_stats
+
+        # --- Process DSLD ---
+        if run_dsld:
+            dsld_stats = process_dsld(conn, limit=args.limit)
+            all_stats["dsld"] = dsld_stats
 
         # --- Post-processing ---
         create_indexes(conn)

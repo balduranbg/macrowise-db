@@ -34,6 +34,11 @@ food_names (
 food_names_fts  -- FTS5 virtual table, searches food_names across all languages
 ```
 
+## Documentation
+
+Detailed specs for individual data-source integrations live in `docs/`:
+- `docs/DSLD_Integration_Brief.md` — DSLD (NIH Dietary Supplement Label Database) integration: scope, schema changes, conversion logic
+
 ## Quality filter
 
 Only products with **calories + protein + carbs + fat** all present are included.

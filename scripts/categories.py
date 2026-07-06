@@ -187,6 +187,17 @@ def normalise_usda_category(food_group: str | None) -> str:
     return normalise_category(None, food_group)
 
 
+def normalise_dsld_category() -> str:
+    """
+    Return Macrowise category for a DSLD label.
+
+    DSLD ingestion is scoped to Powders/Liquids only (see
+    docs/DSLD_Integration_Brief_1.md) — every included product is a
+    supplement, so this always returns "supplements".
+    """
+    return "supplements"
+
+
 # ---------------------------------------------------------------------------
 # Icon name mapping — used by the Flutter app
 # Maps Macrowise category -> Phosphor icon name
