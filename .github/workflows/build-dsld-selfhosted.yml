@@ -1,0 +1,82 @@
+name: Build DSLD (self-hosted, long-running)
+
+# Separate from the monthly OFF/USDA build.yml — this job can take ~18+
+# hours (or longer, depending on DSLD's rate limits), which exceeds what a
+# GitHub-hosted runner allows in a single job. It runs on a self-hosted
+# runner instead (registered from a NAS/server that can stay on for days),
+# with no schedule — trigger manually when ready.
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Row limit (leave empty for full build)"
+        required: false
+        default: ""
+
+jobs:
+  build-dsld:
+    name: Build DSLD-only database
+    runs-on: [self-hosted, synology, dsld]
+    # Generous ceiling (14 days) — the job itself is expected to take
+    # roughly 18-24 hours, but DSLD's real sustained rate limit over long
+    # periods isn't fully confirmed yet, so this leaves wide margin rather
+    # than risk GitHub killing a multi-day run right before it finishes.
+    timeout-minutes: 20160
+    permissions:
+      contents: write   # Required to create GitHub Releases
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests tqdm zstandard
+
+      - name: Set version string
+        id: version
+        run: |
+          VERSION="dsld-$(date +%Y-%m-%d)"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Build DSLD database
+        env:
+          # Persistent path OUTSIDE the git checkout, so it survives both
+          # a crashed/restarted job and actions/checkout's default cleanup
+          # of the workspace. Must match a volume mounted into the runner
+          # container (see the Synology/Portainer setup instructions) —
+          # otherwise this just falls back to a local ./cache/dsld folder
+          # inside the checkout, which checkout WILL wipe between runs.
+          DSLD_CACHE_DIR: /dsld-persistent-cache
+        run: |
+          cd scripts
+          ARGS="--dsld-only"
+          if [ -n "${{ inputs.limit }}" ]; then ARGS="$ARGS --limit ${{ inputs.limit }}"; fi
+          python3 build_db.py $ARGS
+          mv macrowise-foods.db.zst ../
+          mv version.json ../
+
+      - name: Verify output files exist
+        run: |
+          ls -lh macrowise-foods.db.zst version.json
+          echo "Database size: $(du -sh macrowise-foods.db.zst | cut -f1)"
+
+      - name: Create GitHub Release (DSLD-only, not marked latest)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: "DSLD Database ${{ steps.version.outputs.version }}"
+          body_path: version.json
+          files: |
+            macrowise-foods.db.zst
+            version.json
+          make_latest: false
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
