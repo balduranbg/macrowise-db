@@ -681,11 +681,53 @@ def process_usda(conn: sqlite3.Connection, api_key: str,
 # DSLD (Dietary Supplement Label Database) processing
 # ---------------------------------------------------------------------------
 
+DSLD_MAX_BACKOFF_SECONDS = 900  # cap a single wait at 15 minutes
+
+
+def _dsld_get(url: str, params: dict | None = None) -> requests.Response:
+    """
+    GET with retry/backoff on 429 (rate limit) and 5xx (transient server
+    errors). Honours the Retry-After header when DSLD sends one, otherwise
+    backs off exponentially (2, 4, 8... capped at DSLD_MAX_BACKOFF_SECONDS).
+    Retries indefinitely — an unattended multi-hour/multi-day run should
+    wait out a rate limit rather than give up and lose all progress.
+    """
+    attempt = 0
+    while True:
+        try:
+            response = requests.get(url, params=params, timeout=30)
+        except requests.RequestException as e:
+            attempt += 1
+            wait = min(2 ** attempt, DSLD_MAX_BACKOFF_SECONDS)
+            log.warning(f"DSLD network error ({e}) — retrying in {wait}s")
+            time.sleep(wait)
+            continue
+
+        if response.status_code == 429 or response.status_code >= 500:
+            attempt += 1
+            retry_after = response.headers.get("Retry-After")
+            if retry_after is not None:
+                try:
+                    wait = min(float(retry_after), DSLD_MAX_BACKOFF_SECONDS)
+                except ValueError:
+                    wait = min(2 ** attempt, DSLD_MAX_BACKOFF_SECONDS)
+            else:
+                wait = min(2 ** attempt, DSLD_MAX_BACKOFF_SECONDS)
+            log.warning(
+                f"DSLD API returned {response.status_code} — backing off {wait:.0f}s "
+                f"(attempt {attempt})"
+            )
+            time.sleep(wait)
+            continue
+
+        response.raise_for_status()
+        return response
+
+
 def _dsld_search_page(params: dict, from_: int, size: int) -> dict:
     """One page of the DSLD search-filter endpoint."""
     query = {**params, "from": from_, "size": size}
-    response = requests.get(DSLD_SEARCH_URL, params=query, timeout=30)
-    response.raise_for_status()
+    response = _dsld_get(DSLD_SEARCH_URL, params=query)
     return response.json()
 
 
@@ -931,109 +973,152 @@ def _extract_dsld_nutrients(label: dict) -> dict | None:
     return nutrients
 
 
-def process_dsld(conn: sqlite3.Connection, limit: int | None = None) -> dict:
+def _load_dsld_checkpoint(checkpoint_path: str | None) -> set[str]:
+    """Load the set of label IDs already attempted in a prior run, if any."""
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        return set()
+    with open(checkpoint_path, "r") as f:
+        return {line.strip() for line in f if line.strip()}
+
+
+def process_dsld(conn: sqlite3.Connection, limit: int | None = None,
+                  checkpoint_path: str | None = None) -> dict:
     """
     Fetch DSLD supplement labels (Powders + Liquids only) and insert into DB.
 
     Two-step fetch: search-filter to enumerate candidate label IDs (filtered
     server-side via the supplement_form param), then /label/{id} for full
     serving-size and nutrient detail. Returns stats dict.
+
+    If checkpoint_path is given, every attempted label ID is appended there
+    (flushed immediately), and any ID already present on startup is skipped —
+    this lets a killed/crashed run resume without refetching work already
+    done or double-inserting rows on restart. Pass None to disable (default
+    OFF/USDA/combined runs are unaffected either way).
     """
     stats = {"processed": 0, "inserted": 0, "skipped_nutrients": 0,
              "skipped_form": 0, "skipped_noname": 0, "errors": 0, "api_errors": 0,
-             "ambiguous_quantity_labels": 0, "ambiguous_quantity_fields": 0}
+             "ambiguous_quantity_labels": 0, "ambiguous_quantity_fields": 0,
+             "ambiguous_label_ids": []}
+
+    done = _load_dsld_checkpoint(checkpoint_path)
+    if done:
+        log.info(f"Resuming DSLD run: {len(done)} label(s) already attempted previously, skipping them")
+
+    checkpoint_file = open(checkpoint_path, "a") if checkpoint_path else None
 
     log.info("Fetching DSLD supplement labels (Powders + Liquids)...")
 
-    for label_id in tqdm(_enumerate_dsld_ids(), desc="DSLD labels", unit=" labels"):
-        if limit and stats["processed"] >= limit:
-            break
-
-        stats["processed"] += 1
-
-        try:
-            response = requests.get(DSLD_LABEL_URL.format(id=label_id), timeout=30)
-            response.raise_for_status()
-            label = response.json()
-        except requests.RequestException as e:
-            stats["api_errors"] += 1
-            log.warning(f"DSLD API error fetching label {label_id}: {e}")
-            continue
-        finally:
-            time.sleep(0.1)  # Be polite to the DSLD API
-
-        try:
-            # --- Filter to in-scope physical forms (defensive re-check) ---
-            physical_state = label.get("physicalState") or {}
-            if physical_state.get("langualCode") not in DSLD_INCLUDED_FORMS:
-                stats["skipped_form"] += 1
-                continue
-
-            # --- Extract and convert nutrients ---
-            nutrients = _extract_dsld_nutrients(label)
-            if nutrients is None:
-                stats["skipped_nutrients"] += 1
-                continue
-
-            quantity_basis = nutrients.pop("_quantity_basis")
-            ambiguous_fields = nutrients.pop("_ambiguous_fields")
-            if ambiguous_fields:
-                stats["ambiguous_quantity_labels"] += 1
-                stats["ambiguous_quantity_fields"] += len(ambiguous_fields)
-                log.info(
-                    f"DSLD label {label_id}: last-match tie-break used for "
-                    f"quantity field(s) {ambiguous_fields} (multiple quantity[] "
-                    f"entries shared the same servingSizeQuantity)"
-                )
-
-            if "calories" in nutrients:
-                nutrients["calories"] = round(nutrients["calories"])
-
-            missing = REQUIRED_NUTRIENTS - set(nutrients.keys())
-            if missing:
-                stats["skipped_nutrients"] += 1
-                continue
-
-            # --- Name ---
-            name = (label.get("fullName") or "").strip()
-            if not name:
-                stats["skipped_noname"] += 1
-                continue
-            names = {"en": name}
-
-            # --- Metadata ---
-            brand = (label.get("brandName") or "").strip() or None
-
-            food = {
-                **nutrients,
-                "barcode":             None,   # DSLD has no barcodes
-                "brand":               brand,
-                "source":              "DSLD",
-                "image_url":           None,   # No product images in DSLD
-                "food_category":       normalise_dsld_category(),
-                "serving_description": None,
-                "serving_grams":       None,
-                "popularity":          0,
-                "quantity_basis":      quantity_basis,
-            }
-
-            result = insert_food(conn, food, names)
-            if result is not None:
-                stats["inserted"] += 1
-            else:
-                stats["skipped_noname"] += 1
-
-        except Exception as e:
-            stats["errors"] += 1
-            if stats["errors"] <= 10:
-                log.warning(f"Error processing DSLD label {label_id}: {e}")
-
-        if stats["processed"] % 500 == 0:
-            conn.commit()
+    try:
+        _process_dsld_labels(conn, stats, limit, done, checkpoint_file)
+    finally:
+        if checkpoint_file:
+            checkpoint_file.close()
 
     conn.commit()
     log.info(f"DSLD processing complete: {stats}")
     return stats
+
+
+def _process_dsld_labels(conn, stats, limit, done, checkpoint_file):
+    for label_id in tqdm(_enumerate_dsld_ids(), desc="DSLD labels", unit=" labels"):
+        if limit and stats["processed"] >= limit:
+            break
+
+        if str(label_id) in done:
+            continue
+
+        stats["processed"] += 1
+
+        try:
+            _process_one_dsld_label(conn, stats, label_id)
+        finally:
+            if checkpoint_file:
+                checkpoint_file.write(f"{label_id}\n")
+                checkpoint_file.flush()
+                os.fsync(checkpoint_file.fileno())
+
+        if stats["processed"] % 500 == 0:
+            conn.commit()
+
+
+def _process_one_dsld_label(conn, stats, label_id):
+    try:
+        response = _dsld_get(DSLD_LABEL_URL.format(id=label_id))
+        label = response.json()
+    except requests.RequestException as e:
+        stats["api_errors"] += 1
+        log.warning(f"DSLD API error fetching label {label_id}: {e}")
+        return
+    finally:
+        time.sleep(0.1)  # Be polite to the DSLD API
+
+    try:
+        # --- Filter to in-scope physical forms (defensive re-check) ---
+        physical_state = label.get("physicalState") or {}
+        if physical_state.get("langualCode") not in DSLD_INCLUDED_FORMS:
+            stats["skipped_form"] += 1
+            return
+
+        # --- Extract and convert nutrients ---
+        nutrients = _extract_dsld_nutrients(label)
+        if nutrients is None:
+            stats["skipped_nutrients"] += 1
+            return
+
+        quantity_basis = nutrients.pop("_quantity_basis")
+        ambiguous_fields = nutrients.pop("_ambiguous_fields")
+        if ambiguous_fields:
+            stats["ambiguous_quantity_labels"] += 1
+            stats["ambiguous_quantity_fields"] += len(ambiguous_fields)
+            stats["ambiguous_label_ids"].append({"id": label_id, "fields": ambiguous_fields})
+            log.info(
+                f"DSLD label {label_id}: last-match tie-break used for "
+                f"quantity field(s) {ambiguous_fields} (multiple quantity[] "
+                f"entries shared the same servingSizeQuantity)"
+            )
+
+        if "calories" in nutrients:
+            nutrients["calories"] = round(nutrients["calories"])
+
+        missing = REQUIRED_NUTRIENTS - set(nutrients.keys())
+        if missing:
+            stats["skipped_nutrients"] += 1
+            return
+
+        # --- Name ---
+        name = (label.get("fullName") or "").strip()
+        if not name:
+            stats["skipped_noname"] += 1
+            return
+        names = {"en": name}
+
+        # --- Metadata ---
+        brand = (label.get("brandName") or "").strip() or None
+
+        food = {
+            **nutrients,
+            "barcode":             None,   # DSLD has no barcodes
+            "brand":               brand,
+            "source":              "DSLD",
+            "image_url":           None,   # No product images in DSLD
+            "food_category":       normalise_dsld_category(),
+            "serving_description": None,
+            "serving_grams":       None,
+            "popularity":          0,
+            "quantity_basis":      quantity_basis,
+        }
+
+        result = insert_food(conn, food, names)
+        if result is not None:
+            stats["inserted"] += 1
+        else:
+            stats["skipped_noname"] += 1
+
+    except Exception as e:
+        stats["errors"] += 1
+        if stats["errors"] <= 10:
+            log.warning(f"Error processing DSLD label {label_id}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1172,8 +1257,21 @@ def main():
         log.warning("Using DEMO_KEY for USDA — rate limits apply. "
                     "Set USDA_API_KEY env var for production.")
 
-    # Work directory — use persistent cache dir if --keep-csv, otherwise temp
-    if args.keep_csv:
+    # Work directory — use persistent cache dir if --keep-csv, otherwise temp.
+    # --dsld-only always uses a persistent directory (DSLD_CACHE_DIR env var,
+    # or a local fallback) regardless of --keep-csv, since a multi-hour/
+    # multi-day DSLD run needs its db + checkpoint file to survive a crash
+    # or restart — this has no effect on OFF/USDA-only or combined runs.
+    dsld_checkpoint_path = None
+    if args.dsld_only:
+        work_dir = os.environ.get(
+            "DSLD_CACHE_DIR",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cache", "dsld"),
+        )
+        os.makedirs(work_dir, exist_ok=True)
+        dsld_checkpoint_path = os.path.join(work_dir, "dsld_checkpoint.txt")
+        log.info(f"Using persistent DSLD working directory: {os.path.abspath(work_dir)}")
+    elif args.keep_csv:
         work_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cache")
         os.makedirs(work_dir, exist_ok=True)
         log.info(f"Using persistent cache directory: {os.path.abspath(work_dir)}")
@@ -1213,7 +1311,7 @@ def main():
 
         # --- Process DSLD ---
         if run_dsld:
-            dsld_stats = process_dsld(conn, limit=args.limit)
+            dsld_stats = process_dsld(conn, limit=args.limit, checkpoint_path=dsld_checkpoint_path)
             all_stats["dsld"] = dsld_stats
 
         # --- Post-processing ---
@@ -1260,7 +1358,10 @@ def main():
         sys.exit(1)
 
     finally:
-        if not args.keep_csv:
+        # Never clean up the persistent DSLD working directory — its whole
+        # point is to survive across runs so a crash/restart can resume
+        # instead of refetching ~69k labels from scratch.
+        if not args.keep_csv and not args.dsld_only:
             shutil.rmtree(work_dir, ignore_errors=True)
 
 
